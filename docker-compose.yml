@@ -1,0 +1,54 @@
+# Full stack, built from source. `make up` then open http://localhost:8080
+#
+# The shape mirrors the AWS deployment: the browser talks to one origin, that
+# origin serves the static bundle and forwards /api/* to the backend, and the
+# backend is the only thing that can reach Postgres.
+
+name: nib-shop
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: nib
+      POSTGRES_PASSWORD: nib
+      POSTGRES_DB: nibshop
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "${DB_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nib -d nibshop"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_URL: postgresql+asyncpg://nib:nib@db:5432/nibshop
+      ENVIRONMENT: ${ENVIRONMENT:-local-compose}
+      APP_VERSION: ${APP_VERSION:-0.1.0}
+      GIT_SHA: ${GIT_SHA:-dev}
+      CORS_ORIGINS: "*"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8000}:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      # Empty: the SPA calls /api on its own origin and nginx proxies it,
+      # exactly as CloudFront does in front of the ALB.
+      API_BASE_URL: ""
+    depends_on:
+      - backend
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+
+volumes:
+  pgdata:
