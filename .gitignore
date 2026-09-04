@@ -12,6 +12,7 @@ dist/
 *.tsbuildinfo
 
 # env & local state
+*.db
 .env
 .env.local
 *.log

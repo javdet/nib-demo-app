@@ -30,6 +30,9 @@ include = ["app*"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+# Make `app` importable under a bare `pytest` too, not just `python -m pytest`
+# (which puts the working directory on sys.path and hides the difference).
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
