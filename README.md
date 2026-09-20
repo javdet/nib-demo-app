@@ -142,26 +142,48 @@ CI runs `alembic check` to fail a build whose migrations have drifted from the m
 
 ## Deploying to AWS
 
-The infrastructure code is **not in this repository yet** — it is the next piece of work. What the
-application already assumes, so that the Terraform lands against a service that is ready for it:
+The infrastructure lives in [infra/terraform](infra/terraform) — CloudFront + S3 for the SPA, an
+ALB in front of ECS Fargate for the API, RDS Postgres behind that, all in one `production`
+environment in `us-east-1`. See [infra/terraform/README.md](infra/terraform/README.md) for the
+full topology; the shape of it:
 
-- **Frontend** — `npm run build` produces `frontend/dist`. Sync `assets/` first with a long
-  `max-age`, then `index.html` and `config.json` with `no-store`, so a deploy never serves a new
-  shell against old chunks. The bucket stays private; CloudFront reads it through an Origin Access
-  Control, and a 403/404 response rewrite to `/index.html` keeps client-side routes working.
-- **API** — `backend/Dockerfile` builds a non-root image listening on 8000. Point the target
-  group's health check at `/api/health/ready` and give the task role nothing it does not need. The
-  entrypoint runs `alembic upgrade head` before serving; concurrent tasks are safe, because
-  Alembic locks `alembic_version` and the losers no-op.
-- **Database** — RDS for PostgreSQL in private subnets, reachable only from the task security
-  group. Compose `DATABASE_URL` from Secrets Manager and inject it as a task-definition secret,
-  not a plain environment variable.
+- **Frontend** — `npm run build` produces `frontend/dist`. `deploy-application` syncs `assets/`
+  first with a one-year immutable `max-age`, then `index.html` and `config.json` with `no-store`,
+  so a deploy never serves a new shell against old chunks. The bucket stays private; CloudFront
+  reads it through an Origin Access Control, and a 403/404 response rewrite to `/index.html` keeps
+  client-side routes working.
+- **API** — `backend/Dockerfile` builds a non-root image listening on 8000. The ALB target group's
+  health check is `/api/health/ready`, and the ECS task role is granted nothing — the application
+  only ever talks to Postgres. The entrypoint runs `alembic upgrade head` before serving;
+  concurrent tasks are safe, because Alembic locks `alembic_version` and the losers no-op.
+- **Database** — Multi-AZ RDS for PostgreSQL in isolated private subnets, reachable only from the
+  ECS task security group. `DATABASE_URL` is composed in Secrets Manager
+  (`aws-secretsmanager:nib-demo/prod/database`, real secret name `nib-demo/prod/database`) and
+  injected as a task-definition secret, never a plain environment variable.
 - **Routing** — one CloudFront distribution with two origins: S3 as the default, and the ALB for
-  `/api/*` with caching disabled and the full query string forwarded. That keeps the SPA and the
-  API on one origin, so there is no CORS to configure and no preflight on every request.
+  `/api/*` with caching disabled and the full query string, method set and required headers
+  forwarded. That keeps the SPA and the API on one origin, so there is no CORS to configure and no
+  preflight on every request.
 
-`./scripts/smoke.sh https://your-domain` is the post-deploy check; it exercises the catalogue, a
-cart, a checkout and the SPA fallback.
+### Deploying
+
+Two workflows, run in order, both from the Actions tab:
+
+1. **[Deploy Infrastructure](.github/workflows/deploy-infrastructure.yml)** — plans on every push
+   or PR that touches `infra/terraform/**`; applies only from a manual `workflow_dispatch` with
+   `apply: true`, gated by the `production` environment's required reviewers. Run this first, and
+   again after any infrastructure change.
+2. **[Deploy Application](.github/workflows/deploy-application.yml)** — manual `workflow_dispatch`
+   only. Reads every deployment target (ECR repo, ECS cluster/service, S3 bucket, CloudFront
+   distribution) from that Terraform state's outputs, builds and pushes the backend image, rolls
+   the ECS service, then builds and syncs the frontend and invalidates CloudFront.
+
+Both need a `production` GitHub environment with the repository variable `AWS_DEPLOY_ROLE_ARN` set
+to an IAM role assumable via OIDC from this repository — no long-lived AWS credentials are stored
+in GitHub.
+
+`./scripts/smoke.sh https://your-domain` is the post-deploy check `deploy-application` runs
+automatically; it exercises the catalogue, a cart, a checkout and the SPA fallback.
 
 ## Notes
 

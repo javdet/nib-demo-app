@@ -1,0 +1,194 @@
+name: Deploy Application
+
+# The manual second half of the runbook (see README.md): `Deploy
+# Infrastructure` must have applied at least once first, since every target
+# here - the ECR repo, the ECS cluster/service, the S3 bucket, the CloudFront
+# distribution - is read from that configuration's remote state, not
+# hardcoded here.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-application-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: "1.10.5"
+  TF_STATE_KEY: nib-demo/prod/terraform.tfstate
+
+jobs:
+  deploy-backend:
+    name: Deploy backend
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      web_bucket_name: ${{ steps.tf-outputs.outputs.web_bucket_name }}
+      cloudfront_distribution_id: ${{ steps.tf-outputs.outputs.cloudfront_distribution_id }}
+      cloudfront_domain_name: ${{ steps.tf-outputs.outputs.cloudfront_domain_name }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - uses: hashicorp/setup-terraform@v3.1.2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4.1.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Account id
+        id: account
+        run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
+
+      - name: Read Terraform outputs
+        id: tf-outputs
+        working-directory: infra/terraform
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=nib-demo-terraform-state-${{ steps.account.outputs.id }}" \
+            -backend-config="key=${{ env.TF_STATE_KEY }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+          for name in ecr_repository_url ecs_cluster_name ecs_service_name \
+                      web_bucket_name cloudfront_distribution_id cloudfront_domain_name; do
+            echo "${name}=$(terraform output -raw "${name}")" >> "$GITHUB_OUTPUT"
+          done
+
+      - uses: aws-actions/amazon-ecr-login@v2.0.1
+        id: ecr-login
+
+      - uses: docker/setup-buildx-action@v3.10.0
+
+      - name: Build and push the API image
+        uses: docker/build-push-action@v6.18.0
+        with:
+          context: ./backend
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tf-outputs.outputs.ecr_repository_url }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Register a new task definition revision
+        id: register
+        env:
+          CLUSTER: ${{ steps.tf-outputs.outputs.ecs_cluster_name }}
+          SERVICE: ${{ steps.tf-outputs.outputs.ecs_service_name }}
+          IMAGE: ${{ steps.tf-outputs.outputs.ecr_repository_url }}:${{ github.sha }}
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "$SERVICE" \
+            --query 'taskDefinition' > current-task-def.json
+
+          # Strip the fields describe-task-definition returns but
+          # register-task-definition rejects, and replace only the `api`
+          # container's image - every other container setting (env,
+          # secrets, log config) carries over unchanged.
+          jq --arg image "$IMAGE" '
+            .containerDefinitions = [
+              .containerDefinitions[] |
+              if .name == "api" then .image = $image else . end
+            ]
+            | del(
+                .taskDefinitionArn, .revision, .status, .requiresAttributes,
+                .compatibilities, .registeredAt, .registeredBy
+              )
+          ' current-task-def.json > new-task-def.json
+
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-def.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "task_def_arn=${NEW_TASK_DEF_ARN}" >> "$GITHUB_OUTPUT"
+
+      - name: Update the service and wait for stability
+        env:
+          CLUSTER: ${{ steps.tf-outputs.outputs.ecs_cluster_name }}
+          SERVICE: ${{ steps.tf-outputs.outputs.ecs_service_name }}
+          TASK_DEF_ARN: ${{ steps.register.outputs.task_def_arn }}
+        run: |
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --task-definition "$TASK_DEF_ARN" \
+            --desired-count 2 >/dev/null
+
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+
+  deploy-frontend:
+    name: Deploy frontend
+    needs: deploy-backend
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: aws-actions/configure-aws-credentials@v4.1.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build
+        working-directory: frontend
+        env:
+          # Empty: the SPA calls /api on its own origin, which CloudFront's
+          # /api/* behavior forwards to the ALB - no cross-origin API to point at.
+          VITE_API_BASE_URL: ""
+        run: npm run build
+
+      - name: Sync hashed assets (immutable, one-year cache)
+        env:
+          WEB_BUCKET: ${{ needs.deploy-backend.outputs.web_bucket_name }}
+        run: |
+          aws s3 sync frontend/dist/assets "s3://${WEB_BUCKET}/assets" \
+            --cache-control "public, max-age=31536000, immutable" \
+            --delete
+
+      - name: Sync the shell (index.html, config.json, no-store)
+        env:
+          WEB_BUCKET: ${{ needs.deploy-backend.outputs.web_bucket_name }}
+        run: |
+          aws s3 sync frontend/dist "s3://${WEB_BUCKET}" \
+            --exclude "assets/*" \
+            --cache-control "no-store" \
+            --delete
+
+      - name: Invalidate CloudFront
+        id: invalidate
+        env:
+          DISTRIBUTION_ID: ${{ needs.deploy-backend.outputs.cloudfront_distribution_id }}
+        run: |
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths "/*" \
+            --query 'Invalidation.Id' --output text)
+          echo "id=${INVALIDATION_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for the invalidation to complete
+        env:
+          DISTRIBUTION_ID: ${{ needs.deploy-backend.outputs.cloudfront_distribution_id }}
+        run: |
+          aws cloudfront wait invalidation-completed \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --id "${{ steps.invalidate.outputs.id }}"
+
+      - name: Smoke test
+        env:
+          CLOUDFRONT_DOMAIN_NAME: ${{ needs.deploy-backend.outputs.cloudfront_domain_name }}
+        run: ./scripts/smoke.sh "https://${CLOUDFRONT_DOMAIN_NAME}"
