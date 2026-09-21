@@ -19,7 +19,7 @@ resource "aws_security_group" "alb" {
 
 resource "aws_vpc_security_group_ingress_rule" "alb_http_from_cloudfront" {
   security_group_id = aws_security_group.alb.id
-  description       = "HTTP from CloudFront's origin-facing IP ranges only."
+  description       = "HTTP from CloudFront origin-facing IP ranges only."
   prefix_list_id    = data.aws_ec2_managed_prefix_list.cloudfront_origin_facing.id
   from_port         = 80
   to_port           = 80
