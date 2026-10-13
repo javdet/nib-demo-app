@@ -1,0 +1,189 @@
+name: deploy-application
+
+# Builds and ships the application onto infrastructure that already exists -
+# run deploy-infrastructure first (and whenever infra/terraform changes).
+# Every identifier this workflow needs (the ECR repository, the frontend
+# bucket, the distribution, the ECS cluster/service/family) is read straight
+# out of Terraform state, so there is nothing here that can drift from what
+# Terraform actually created.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy-application:
+    name: Deploy application
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve AWS account id
+        id: account
+        run: |
+          echo "id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.5"
+
+      # Read-only: this workflow never plans or applies, only reads the state
+      # deploy-infrastructure.yml already produced.
+      - name: Terraform init
+        working-directory: infra/terraform
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=nib-demo-prod-tfstate-${{ steps.account.outputs.id }}" \
+            -backend-config="dynamodb_table=nib-demo-prod-terraform-locks" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Read Terraform outputs
+        id: tf
+        working-directory: infra/terraform
+        run: |
+          {
+            echo "ecr_repository_url=$(terraform output -raw ecr_repository_url)"
+            echo "frontend_bucket_name=$(terraform output -raw frontend_bucket_name)"
+            echo "cloudfront_distribution_id=$(terraform output -raw cloudfront_distribution_id)"
+            echo "app_url=$(terraform output -raw app_url)"
+            echo "ecs_cluster_name=$(terraform output -raw ecs_cluster_name)"
+            echo "ecs_service_name=$(terraform output -raw ecs_service_name)"
+            echo "ecs_task_definition_family=$(terraform output -raw ecs_task_definition_family)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve app version
+        id: version
+        run: |
+          echo "value=$(grep -m1 '^version = ' backend/pyproject.toml | sed -E 's/version = "(.*)"/\1/')" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------- backend --
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push the backend image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./backend
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.tf.outputs.ecr_repository_url }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ---------------------------------------------------------- frontend --
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build the frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Write runtime config
+        run: |
+          cat > frontend/dist/config.json <<'JSON'
+          {
+            "apiBaseUrl": ""
+          }
+          JSON
+
+      - name: Sync hashed assets (long-lived cache, no deletions yet)
+        run: |
+          aws s3 sync frontend/dist/assets "s3://${{ steps.tf.outputs.frontend_bucket_name }}/assets" \
+            --cache-control "public, max-age=31536000, immutable"
+
+      - name: Upload the SPA shell and runtime config (no-store)
+        run: |
+          aws s3 cp frontend/dist/index.html "s3://${{ steps.tf.outputs.frontend_bucket_name }}/index.html" \
+            --cache-control "no-store" --content-type "text/html"
+          aws s3 cp frontend/dist/config.json "s3://${{ steps.tf.outputs.frontend_bucket_name }}/config.json" \
+            --cache-control "no-store" --content-type "application/json"
+
+      - name: Remove assets no longer referenced
+        run: |
+          aws s3 sync frontend/dist/assets "s3://${{ steps.tf.outputs.frontend_bucket_name }}/assets" \
+            --cache-control "public, max-age=31536000, immutable" \
+            --delete
+
+      # ------------------------------------------------------------- ecs --
+
+      - name: Render the new task-definition revision
+        id: render
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ steps.tf.outputs.ecs_task_definition_family }}" \
+            --query taskDefinition > task-definition.json
+
+          jq --arg image "${{ steps.tf.outputs.ecr_repository_url }}:${{ github.sha }}" \
+             --arg version "${{ steps.version.outputs.value }}" \
+             --arg sha "${{ github.sha }}" '
+            .containerDefinitions[0].image = $image
+            | .containerDefinitions[0].environment = (
+                .containerDefinitions[0].environment
+                | map(if .name == "APP_VERSION" then .value = $version
+                      elif .name == "GIT_SHA" then .value = $sha
+                      else . end)
+              )
+            | {family, taskRoleArn, executionRoleArn, networkMode, containerDefinitions,
+               requiresCompatibilities, cpu, memory}
+          ' task-definition.json > rendered-task-definition.json
+
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://rendered-task-definition.json \
+            --query taskDefinition.taskDefinitionArn --output text)
+          echo "task_definition_arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Update the service and raise desired count to 1
+        run: |
+          aws ecs update-service \
+            --cluster "${{ steps.tf.outputs.ecs_cluster_name }}" \
+            --service "${{ steps.tf.outputs.ecs_service_name }}" \
+            --task-definition "${{ steps.render.outputs.task_definition_arn }}" \
+            --desired-count 1 >/dev/null
+
+      - name: Wait for the service to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ steps.tf.outputs.ecs_cluster_name }}" \
+            --services "${{ steps.tf.outputs.ecs_service_name }}"
+
+      # --------------------------------------------------------- cdn/verify --
+
+      - name: Invalidate CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ steps.tf.outputs.cloudfront_distribution_id }}" \
+            --paths "/*"
+
+      - name: Smoke test
+        run: ./scripts/smoke.sh "${{ steps.tf.outputs.app_url }}"

@@ -21,3 +21,18 @@ dist/
 # editors
 .idea/
 .vscode/
+
+# terraform (the .terraform.lock.hcl provider lock file is NOT ignored - it
+# is checked in so every apply uses the exact provider build this was tested
+# against)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json

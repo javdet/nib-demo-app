@@ -56,6 +56,37 @@ jobs:
       - run: npm run test
       - run: npm run build
 
+  infrastructure:
+    name: Infrastructure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.5"
+
+      - name: Terraform fmt
+        working-directory: infra/terraform
+        run: terraform fmt -check -recursive
+
+      # No backend, no credentials: this only checks that the configuration
+      # itself is well-formed, the same thing deploy-infrastructure.yml does
+      # before it ever touches the real backend.
+      - name: Terraform init
+        working-directory: infra/terraform
+        run: terraform init -backend=false -input=false
+
+      - name: Terraform validate
+        working-directory: infra/terraform
+        run: terraform validate
+
+      - name: Install cfn-lint
+        run: pip install --quiet cfn-lint
+
+      - name: Validate the bootstrap CloudFormation template
+        run: cfn-lint infra/bootstrap/template.yml
+
   images:
     name: Images
     runs-on: ubuntu-latest

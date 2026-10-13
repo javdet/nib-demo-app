@@ -1,0 +1,627 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  One-time bootstrap for Nib & Slate production (account 216033279229, us-east-1):
+  the Terraform state bucket, the lock table, the GitHub Actions OIDC trust, and the
+  deployment role that infra/terraform runs as. Applied by hand, once, before the
+  deploy-infrastructure workflow ever runs; everything after this is Terraform's job.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Default: javdet
+    Description: GitHub organisation/user that owns the repository.
+
+  GitHubRepo:
+    Type: String
+    Default: nib-demo-app
+    Description: Repository the deployment role trusts.
+
+  CreateGitHubOidcProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Leave as "true" the first time this template is applied in the account. If the
+      account already has a token.actions.githubusercontent.com OIDC provider
+      (IAM allows only one per URL), switch to "false" and set
+      ExistingGitHubOidcProviderArn instead of failing with AlreadyExists.
+
+  ExistingGitHubOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: >
+      Only read when CreateGitHubOidcProvider is "false" - the ARN of the OIDC
+      provider already present in the account.
+
+Conditions:
+  ShouldCreateOidcProvider: !Equals [!Ref CreateGitHubOidcProvider, "true"]
+
+Resources:
+  # ------------------------------------------------------------- state bucket --
+  TerraformStateBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub "nib-demo-prod-tfstate-${AWS::AccountId}"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Application
+          Value: nib-demo-app
+        - Key: Environment
+          Value: production
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  TerraformStateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TerraformStateBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt TerraformStateBucket.Arn
+              - !Sub "${TerraformStateBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  # --------------------------------------------------------------- lock table --
+  TerraformLockTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: nib-demo-prod-terraform-locks
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: LockID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: LockID
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Application
+          Value: nib-demo-app
+        - Key: Environment
+          Value: production
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ------------------------------------------------------------- OIDC trust --
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        # GitHub's OIDC endpoint chains to a public CA already in AWS's trust
+        # store; IAM accepts the create call without validating these against
+        # the live certificate, but the field is still required on this
+        # resource type. Both are long-standing, widely-published values for
+        # token.actions.githubusercontent.com.
+        - 6938fd4d98bab03faadb97b34396831e3780aea
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  # ------------------------------------------------------------ deploy role --
+  DeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: nib-demo-prod-deploy
+      Description: >-
+        Assumed by GitHub Actions (OIDC) for the production environment of
+        javdet/nib-demo-app. Used by both deploy-infrastructure.yml and
+        deploy-application.yml - no long-lived AWS credentials exist for this repo.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - ShouldCreateOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Ref ExistingGitHubOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+              StringLike:
+                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubOrg}/${GitHubRepo}:environment:production"
+      Tags:
+        - Key: Application
+          Value: nib-demo-app
+        - Key: Environment
+          Value: production
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---- Terraform state backend: the bucket/table above, plus the exact S3 --
+  # ---- and DynamoDB calls the S3 backend issues on every init/plan/apply. --
+  TerraformBackendPolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref DeploymentRole
+      PolicyName: nib-demo-prod-terraform-backend
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: StateBucket
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketVersioning
+            Resource: !GetAtt TerraformStateBucket.Arn
+          - Sid: StateObjects
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+            Resource: !Sub "${TerraformStateBucket.Arn}/*"
+          - Sid: LockTable
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:DeleteItem
+              - dynamodb:DescribeTable
+            Resource: !GetAtt TerraformLockTable.Arn
+
+  # ---- Networking: EC2/VPC create/describe/modify/delete for the VPC, -----
+  # ---- subnets, route tables, IGW, NAT gateway and security groups that ---
+  # ---- network.tf and security.tf own. Most EC2 actions have no ARN-level -
+  # ---- resource type in IAM (AWS limitation, not a scoping choice here); --
+  # ---- mutating calls are constrained instead by the Application tag that -
+  # ---- the Terraform provider's default_tags stamps onto every create. ---
+  NetworkPolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref DeploymentRole
+      PolicyName: nib-demo-prod-network
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Describe
+            Effect: Allow
+            Action:
+              - ec2:DescribeVpcs
+              - ec2:DescribeVpcAttribute
+              - ec2:DescribeSubnets
+              - ec2:DescribeRouteTables
+              - ec2:DescribeInternetGateways
+              - ec2:DescribeNatGateways
+              - ec2:DescribeAddresses
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeSecurityGroupRules
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DescribeAvailabilityZones
+              - ec2:DescribeManagedPrefixLists
+              - ec2:DescribeTags
+              - ec2:DescribeAccountAttributes
+            Resource: "*"
+          - Sid: CreateTagged
+            Effect: Allow
+            Action:
+              - ec2:CreateVpc
+              - ec2:CreateSubnet
+              - ec2:CreateRouteTable
+              - ec2:CreateInternetGateway
+              - ec2:CreateNatGateway
+              - ec2:AllocateAddress
+              - ec2:CreateSecurityGroup
+              - ec2:CreateTags
+            Resource: "*"
+            Condition:
+              StringEquals:
+                "aws:RequestTag/Application": nib-demo-app
+          - Sid: Modify
+            Effect: Allow
+            Action:
+              - ec2:ModifyVpcAttribute
+              - ec2:AssociateRouteTable
+              - ec2:DisassociateRouteTable
+              - ec2:CreateRoute
+              - ec2:ReplaceRoute
+              - ec2:DeleteRoute
+              - ec2:AttachInternetGateway
+              - ec2:DetachInternetGateway
+              - ec2:AuthorizeSecurityGroupIngress
+              - ec2:AuthorizeSecurityGroupEgress
+              - ec2:RevokeSecurityGroupIngress
+              - ec2:RevokeSecurityGroupEgress
+              - ec2:ModifySubnetAttribute
+              - ec2:AssociateAddress
+              - ec2:DisassociateAddress
+            Resource: "*"
+          - Sid: Delete
+            Effect: Allow
+            Action:
+              - ec2:DeleteVpc
+              - ec2:DeleteSubnet
+              - ec2:DeleteRouteTable
+              - ec2:DeleteInternetGateway
+              - ec2:DeleteNatGateway
+              - ec2:ReleaseAddress
+              - ec2:DeleteSecurityGroup
+              - ec2:DeleteTags
+            Resource: "*"
+            Condition:
+              StringEquals:
+                "ec2:ResourceTag/Application": nib-demo-app
+
+  # ---- Load balancing: ALB, target group, listener, listener rule. --------
+  LoadBalancerPolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref DeploymentRole
+      PolicyName: nib-demo-prod-elbv2
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Describe
+            Effect: Allow
+            Action:
+              - elasticloadbalancing:DescribeLoadBalancers
+              - elasticloadbalancing:DescribeLoadBalancerAttributes
+              - elasticloadbalancing:DescribeTargetGroups
+              - elasticloadbalancing:DescribeTargetGroupAttributes
+              - elasticloadbalancing:DescribeTargetHealth
+              - elasticloadbalancing:DescribeListeners
+              - elasticloadbalancing:DescribeListenerAttributes
+              - elasticloadbalancing:DescribeRules
+              - elasticloadbalancing:DescribeTags
+            Resource: "*"
+          - Sid: Create
+            Effect: Allow
+            Action:
+              - elasticloadbalancing:CreateLoadBalancer
+              - elasticloadbalancing:CreateTargetGroup
+              - elasticloadbalancing:CreateListener
+              - elasticloadbalancing:CreateRule
+              - elasticloadbalancing:AddTags
+            Resource: "*"
+            Condition:
+              StringEquals:
+                "aws:RequestTag/Application": nib-demo-app
+          - Sid: Manage
+            Effect: Allow
+            Action:
+              - elasticloadbalancing:ModifyLoadBalancerAttributes
+              - elasticloadbalancing:ModifyTargetGroup
+              - elasticloadbalancing:ModifyTargetGroupAttributes
+              - elasticloadbalancing:ModifyListener
+              - elasticloadbalancing:ModifyListenerAttributes
+              - elasticloadbalancing:ModifyRule
+              - elasticloadbalancing:RegisterTargets
+              - elasticloadbalancing:DeregisterTargets
+              - elasticloadbalancing:SetSecurityGroups
+              - elasticloadbalancing:SetRulePriorities
+              - elasticloadbalancing:DeleteLoadBalancer
+              - elasticloadbalancing:DeleteTargetGroup
+              - elasticloadbalancing:DeleteListener
+              - elasticloadbalancing:DeleteRule
+              - elasticloadbalancing:RemoveTags
+            Resource:
+              - !Sub "arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:loadbalancer/app/nib-demo-prod-*/*"
+              - !Sub "arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/nib-demo-prod-*/*"
+              - !Sub "arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:listener/app/nib-demo-prod-*/*/*"
+              - !Sub "arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:listener-rule/app/nib-demo-prod-*/*/*/*"
+
+  # ---- ECS: cluster, service, task definitions. ---------------------------
+  EcsPolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref DeploymentRole
+      PolicyName: nib-demo-prod-ecs
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Describe
+            Effect: Allow
+            Action:
+              - ecs:DescribeClusters
+              - ecs:DescribeServices
+              - ecs:DescribeTaskDefinition
+              - ecs:ListTagsForResource
+            Resource: "*"
+          - Sid: RegisterTaskDefinition
+            Effect: Allow
+            Action:
+              - ecs:RegisterTaskDefinition
+              - ecs:DeregisterTaskDefinition
+            Resource: "*"
+          - Sid: ManageClusterAndService
+            Effect: Allow
+            Action:
+              - ecs:CreateCluster
+              - ecs:DeleteCluster
+              - ecs:CreateService
+              - ecs:UpdateService
+              - ecs:DeleteService
+              - ecs:TagResource
+              - ecs:UntagResource
+            Resource:
+              - !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/nib-demo-prod"
+              - !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/nib-demo-prod/nib-demo-prod-backend"
+              - !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/nib-demo-prod-backend:*"
+
+  # ---- ECR: the one repository the backend image lives in. ----------------
+  EcrPolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref DeploymentRole
+      PolicyName: nib-demo-prod-ecr
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AuthToken
+            Effect: Allow
+            Action: ecr:GetAuthorizationToken
+            Resource: "*"
+          - Sid: Repository
+            Effect: Allow
+            Action:
+              - ecr:CreateRepository
+              - ecr:DeleteRepository
+              - ecr:DescribeRepositories
+              - ecr:PutLifecyclePolicy
+              - ecr:GetLifecyclePolicy
+              - ecr:PutImageScanningConfiguration
+              - ecr:PutImageTagMutability
+              - ecr:SetRepositoryPolicy
+              - ecr:GetRepositoryPolicy
+              - ecr:TagResource
+              - ecr:UntagResource
+              - ecr:ListTagsForResource
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:PutImage
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+              - ecr:DescribeImages
+              - ecr:DescribeImageScanFindings
+            Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/nib-demo-prod-backend"
+
+  # ---- RDS: one instance, its subnet group. --------------------------------
+  RdsPolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref DeploymentRole
+      PolicyName: nib-demo-prod-rds
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Describe
+            Effect: Allow
+            Action:
+              - rds:DescribeDBInstances
+              - rds:DescribeDBSubnetGroups
+              - rds:ListTagsForResource
+            Resource: "*"
+          - Sid: Instance
+            Effect: Allow
+            Action:
+              - rds:CreateDBInstance
+              - rds:ModifyDBInstance
+              - rds:DeleteDBInstance
+              - rds:AddTagsToResource
+              - rds:RemoveTagsFromResource
+            Resource: !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:nib-demo-prod-postgres"
+          - Sid: SubnetGroup
+            Effect: Allow
+            Action:
+              - rds:CreateDBSubnetGroup
+              - rds:ModifyDBSubnetGroup
+              - rds:DeleteDBSubnetGroup
+            Resource: !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:subgrp:nib-demo-prod*"
+
+  # ---- Secrets Manager: the one secret carrying DATABASE_URL. -------------
+  SecretsManagerPolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref DeploymentRole
+      PolicyName: nib-demo-prod-secrets
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Secret
+            Effect: Allow
+            Action:
+              - secretsmanager:CreateSecret
+              - secretsmanager:DeleteSecret
+              - secretsmanager:DescribeSecret
+              - secretsmanager:GetSecretValue
+              - secretsmanager:PutSecretValue
+              - secretsmanager:TagResource
+              - secretsmanager:UntagResource
+              - secretsmanager:UpdateSecret
+            Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:nib-demo/prod/database-*"
+
+  # ---- CloudFront: one distribution, one OAC, invalidations. --------------
+  # ---- Distribution and OAC creation is only ever "*" in IAM - there is ---
+  # ---- no ARN to scope to before the resource exists - but updates, ------
+  # ---- deletes and invalidations are scoped to the distribution once -----
+  # ---- Terraform has created it. -------------------------------------------
+  CloudFrontPolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref DeploymentRole
+      PolicyName: nib-demo-prod-cloudfront
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Create
+            Effect: Allow
+            Action:
+              - cloudfront:CreateDistribution
+              - cloudfront:CreateDistributionWithTags
+              - cloudfront:CreateOriginAccessControl
+              - cloudfront:GetOriginAccessControl
+              - cloudfront:GetOriginAccessControlConfig
+              - cloudfront:ListDistributions
+              - cloudfront:ListOriginAccessControls
+              - cloudfront:ListTagsForResource
+              - cloudfront:DeleteOriginAccessControl
+              - cloudfront:UpdateOriginAccessControl
+            Resource: "*"
+          - Sid: ManageDistribution
+            Effect: Allow
+            Action:
+              - cloudfront:GetDistribution
+              - cloudfront:GetDistributionConfig
+              - cloudfront:UpdateDistribution
+              - cloudfront:DeleteDistribution
+              - cloudfront:TagResource
+              - cloudfront:UntagResource
+              - cloudfront:CreateInvalidation
+              - cloudfront:GetInvalidation
+              - cloudfront:ListInvalidations
+            Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/*"
+
+  # ---- CloudWatch Logs: the one ECS log group. -----------------------------
+  LogsPolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref DeploymentRole
+      PolicyName: nib-demo-prod-logs
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: LogGroup
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:DeleteLogGroup
+              - logs:PutRetentionPolicy
+              - logs:DescribeLogGroups
+              - logs:TagResource
+              - logs:UntagResource
+              - logs:ListTagsForResource
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/nib-demo-prod*"
+
+  # ---- S3: the frontend bucket and the CloudFront access-log bucket, ------
+  # ---- both created by frontend.tf. ----------------------------------------
+  S3ApplicationBucketsPolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref DeploymentRole
+      PolicyName: nib-demo-prod-s3-app
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: BucketLifecycle
+            Effect: Allow
+            Action:
+              - s3:CreateBucket
+              - s3:DeleteBucket
+              - s3:ListBucket
+              - s3:GetBucketPolicy
+              - s3:PutBucketPolicy
+              - s3:DeleteBucketPolicy
+              - s3:GetBucketVersioning
+              - s3:PutBucketVersioning
+              - s3:GetEncryptionConfiguration
+              - s3:PutEncryptionConfiguration
+              - s3:GetBucketPublicAccessBlock
+              - s3:PutBucketPublicAccessBlock
+              - s3:GetBucketOwnershipControls
+              - s3:PutBucketOwnershipControls
+              - s3:GetBucketAcl
+              - s3:PutBucketAcl
+              - s3:GetBucketLogging
+              - s3:PutBucketLogging
+              - s3:GetBucketTagging
+              - s3:PutBucketTagging
+              - s3:GetBucketCORS
+              - s3:GetBucketWebsite
+              - s3:GetBucketObjectLockConfiguration
+              - s3:GetLifecycleConfiguration
+            Resource:
+              - !Sub "arn:aws:s3:::nib-demo-prod-frontend-${AWS::AccountId}"
+              - !Sub "arn:aws:s3:::nib-demo-prod-cf-logs-${AWS::AccountId}"
+          - Sid: BucketObjects
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+            Resource:
+              - !Sub "arn:aws:s3:::nib-demo-prod-frontend-${AWS::AccountId}/*"
+              - !Sub "arn:aws:s3:::nib-demo-prod-cf-logs-${AWS::AccountId}/*"
+
+  # ---- IAM: the ECS task execution/task roles, and PassRole to ECS only. --
+  IamPolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref DeploymentRole
+      PolicyName: nib-demo-prod-iam
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ManageEcsRoles
+            Effect: Allow
+            Action:
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:GetRole
+              - iam:UpdateRole
+              - iam:TagRole
+              - iam:UntagRole
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:GetRolePolicy
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+              - iam:ListRolePolicies
+              - iam:ListAttachedRolePolicies
+              - iam:ListInstanceProfilesForRole
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/nib-demo-prod-*"
+          - Sid: PassToEcs
+            Effect: Allow
+            Action: iam:PassRole
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/nib-demo-prod-*"
+            Condition:
+              StringEquals:
+                "iam:PassedToService": ecs-tasks.amazonaws.com
+
+Outputs:
+  DeploymentRoleArn:
+    Description: >-
+      Set this as the GitHub environment variable AWS_ROLE_ARN on the
+      "production" environment of javdet/nib-demo-app. Both deploy-infrastructure.yml
+      and deploy-application.yml assume it via OIDC - no access keys are issued.
+    Value: !GetAtt DeploymentRole.Arn
+
+  TerraformStateBucketName:
+    Description: backend "s3" bucket for infra/terraform/providers.tf
+    Value: !Ref TerraformStateBucket
+
+  TerraformLockTableName:
+    Description: backend "s3" dynamodb_table for infra/terraform/providers.tf
+    Value: !Ref TerraformLockTable

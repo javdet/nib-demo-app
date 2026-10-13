@@ -60,6 +60,7 @@ frontend/           React 19 + TypeScript + Vite, no UI framework
   src/components/   layout, product artwork, architecture diagram
   src/pages/        catalog, product, cart, checkout, order, deployment
 scripts/smoke.sh    end-to-end check against a deployed stack
+infra/              Terraform + the one-time CloudFormation bootstrap - see Deploying to AWS
 ```
 
 ## How it works
@@ -142,26 +143,133 @@ CI runs `alembic check` to fail a build whose migrations have drifted from the m
 
 ## Deploying to AWS
 
-The infrastructure code is **not in this repository yet** — it is the next piece of work. What the
-application already assumes, so that the Terraform lands against a service that is ready for it:
+```
+React SPA (Vite)  ->  CloudFront + S3  ->  ALB  ->  ECS Fargate (FastAPI)  ->  RDS Postgres
+```
 
-- **Frontend** — `npm run build` produces `frontend/dist`. Sync `assets/` first with a long
-  `max-age`, then `index.html` and `config.json` with `no-store`, so a deploy never serves a new
-  shell against old chunks. The bucket stays private; CloudFront reads it through an Origin Access
-  Control, and a 403/404 response rewrite to `/index.html` keeps client-side routes working.
-- **API** — `backend/Dockerfile` builds a non-root image listening on 8000. Point the target
-  group's health check at `/api/health/ready` and give the task role nothing it does not need. The
-  entrypoint runs `alembic upgrade head` before serving; concurrent tasks are safe, because
-  Alembic locks `alembic_version` and the losers no-op.
-- **Database** — RDS for PostgreSQL in private subnets, reachable only from the task security
-  group. Compose `DATABASE_URL` from Secrets Manager and inject it as a task-definition secret,
-  not a plain environment variable.
+- **Frontend** — `npm run build` produces `frontend/dist`. The bucket is private; CloudFront reads
+  it through an Origin Access Control, and a 403/404 response rewrite to `/index.html` keeps
+  client-side routes working after a hard refresh.
+- **API** — `backend/Dockerfile` builds a non-root image listening on 8000, behind an ALB target
+  group health-checked at `/api/health/ready`. The entrypoint runs `alembic upgrade head` before
+  serving; concurrent tasks are safe, because Alembic locks `alembic_version` and the losers no-op.
+- **Database** — RDS for PostgreSQL in isolated subnets, reachable only from the ECS task security
+  group. `DATABASE_URL` comes from Secrets Manager as a task-definition secret, never a plain
+  environment variable.
 - **Routing** — one CloudFront distribution with two origins: S3 as the default, and the ALB for
-  `/api/*` with caching disabled and the full query string forwarded. That keeps the SPA and the
-  API on one origin, so there is no CORS to configure and no preflight on every request.
+  `/api/*` with caching disabled and every header, cookie and query string forwarded. That keeps
+  the SPA and the API on one origin, so there is no CORS to configure and no preflight on every
+  request. The ALB itself only accepts traffic that both arrives from CloudFront's published IP
+  ranges and carries a secret header CloudFront injects on every origin request - its public DNS
+  name is not a usable back door around the CDN.
 
-`./scripts/smoke.sh https://your-domain` is the post-deploy check; it exercises the catalogue, a
-cart, a checkout and the SPA fallback.
+### Layout
+
+```
+infra/bootstrap/template.yml   One-time CloudFormation: state bucket, lock table, OIDC, deploy role
+infra/terraform/                Everything deploy-infrastructure.yml applies
+  versions.tf, providers.tf    Terraform 1.16.5, hashicorp/aws 6.68.0, the S3 backend
+  variables.tf, locals.tf      Validated inputs and the fixed production topology
+  production.tfvars            The one environment's values, spelled out explicitly
+  network.tf, security.tf      VPC/subnets/routing; ALB + ECS + RDS security groups
+  ecr.tf, database.tf, ecs.tf  The backend's image repo, database, cluster/service
+  frontend.tf                  S3 + CloudFront
+  outputs.tf                   What deploy-application.yml reads back out
+.github/workflows/
+  deploy-infrastructure.yml    terraform fmt/validate/plan/apply
+  deploy-application.yml       Build, push, sync, register, deploy, invalidate, smoke test
+```
+
+### Cost and availability trade-offs
+
+This is a demo, not a production SLA, so the topology trades resilience for a smaller bill:
+
+| Decision                          | Costs you availability because...                          |
+| ---------------------------------- | ------------------------------------------------------------ |
+| One NAT gateway, not one per AZ    | A NAT-gateway AZ failure takes outbound internet access (ECR pulls, Secrets Manager reads) with it, though the ALB, ECS and RDS keep serving on their own AZ's path. |
+| Single-AZ `db.t4g.micro`           | An AZ failure or instance replacement is a real outage, not a failover. Automated backups and point-in-time recovery still apply. |
+| One backend task                   | No rolling deploys and no spare capacity if the task dies; ECS replaces it, but there is a gap. |
+
+Two Availability Zones are still used for the VPC's subnet tiers and the ALB, so that upgrade path
+(a second NAT gateway, `multi_az = true`, `desired_count = 2`) is a `terraform apply` away, not a
+redesign.
+
+### Prerequisites
+
+1. An AWS account (this configuration assumes account `216033279229` in `us-east-1`; adjust
+   `infra/bootstrap/template.yml`'s hard-coded names and `infra/terraform/production.tfvars` if
+   you fork this against a different one).
+2. A GitHub environment named **production** on `javdet/nib-demo-app`, with no secrets - only the
+   `AWS_ROLE_ARN` **variable** (not a secret) described below. There are no long-lived AWS
+   credentials anywhere in this repository or its GitHub configuration; both workflows assume an
+   IAM role over OIDC.
+3. Terraform `1.16.5` and the AWS CLI, if you want to run any of this from a workstation instead of
+   through the workflows.
+
+### One-time bootstrap
+
+Applied once, by hand, with an administrator's own credentials - everything after this point is
+either Terraform or GitHub Actions:
+
+```bash
+aws cloudformation deploy \
+  --stack-name nib-demo-prod-bootstrap \
+  --template-file infra/bootstrap/template.yml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region us-east-1
+```
+
+This creates the Terraform state bucket (`nib-demo-prod-tfstate-<account-id>`, versioned,
+SSE-S3-encrypted, TLS-only), the DynamoDB lock table (`nib-demo-prod-terraform-locks`), the GitHub
+OIDC provider (skip with `--parameter-overrides CreateGitHubOidcProvider=false
+ExistingGitHubOidcProviderArn=...` if the account already has one - IAM allows only one per URL),
+and a deployment role trusted only for
+`repo:javdet/nib-demo-app:environment:production`. Read the role ARN back out:
+
+```bash
+aws cloudformation describe-stacks --stack-name nib-demo-prod-bootstrap \
+  --query "Stacks[0].Outputs[?OutputKey=='DeploymentRoleArn'].OutputValue" --output text
+```
+
+Set that as the `AWS_ROLE_ARN` **variable** (Settings → Environments → production → Environment
+variables, not Secrets) on the GitHub repository. No value here is a credential, so none of it
+needs to be a GitHub secret.
+
+### Workflow order
+
+1. **`deploy-infrastructure`** (`workflow_dispatch`) - `terraform fmt -check`, `validate`, a saved
+   `plan` against `production.tfvars`, then `apply` of exactly that plan. Non-sensitive outputs
+   (`app_url`, the ECR/ECS/CloudFront identifiers) are printed to the job summary; the database
+   secret's ARN is marked sensitive and is never printed anywhere a log can capture it, and the
+   password itself is never a Terraform output at all. Run this first, and again whenever
+   `infra/terraform` changes.
+2. **`deploy-application`** (`workflow_dispatch`) - reads those same outputs straight from
+   Terraform state (never hand-copied), builds `backend/Dockerfile`, pushes one immutable image
+   tagged with the full commit SHA, builds the frontend and syncs it (hashed assets with long
+   `max-age` first, then the HTML shell and `config.json` with `no-store`, then a second sync that
+   deletes assets no longer referenced - in that order, so a deploy never serves a new shell
+   against chunks that are already gone), registers a new ECS task-definition revision for that
+   image, raises the service to its contracted one task, waits for stability, invalidates
+   CloudFront, and finally runs `./scripts/smoke.sh` against the live `app_url`. Run this after
+   infrastructure exists, and on every application change you want live.
+
+### Recovery
+
+- **Bad application deploy** - re-run `deploy-application` against an earlier commit SHA; the
+  previous image tag is still in ECR (the lifecycle policy keeps the most recent 20) and immutable
+  tags mean it cannot have been overwritten.
+- **Bad infrastructure change** - `terraform plan` against a reverted `infra/terraform` and re-run
+  `deploy-infrastructure`; state lives in S3 with versioning on, so a bad `apply` is also
+  recoverable by restoring the previous state object version if a revert-and-reapply isn't enough.
+- **Lost `AWS_ROLE_ARN` or a rotated OIDC trust** - the bootstrap stack is idempotent
+  (`aws cloudformation deploy` again); re-read the output and reset the GitHub environment
+  variable.
+- **Database restore** - RDS automated backups are retained 7 days with point-in-time recovery;
+  restore to a new instance with the AWS CLI or console and repoint `infra/terraform` at it. The
+  final snapshot policy means even deleting the instance through Terraform leaves one behind.
+
+`./scripts/smoke.sh https://your-app-url` is the same post-deploy check `deploy-application` runs;
+it exercises the catalogue, a cart, a checkout and the SPA fallback against any running stack.
 
 ## Notes
 

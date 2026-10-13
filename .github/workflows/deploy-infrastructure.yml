@@ -1,0 +1,91 @@
+name: deploy-infrastructure
+
+# Applies infra/terraform against the production AWS account. Run this once
+# after infra/bootstrap/template.yml has been applied by hand and
+# AWS_ROLE_ARN is set on the "production" GitHub environment; run it again
+# whenever infra/terraform itself changes. deploy-application.yml depends on
+# the state this workflow produces but does not trigger it - infrastructure
+# changes are reviewed and applied deliberately, not on every push.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  deploy-infrastructure:
+    name: Deploy infrastructure
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Resolve AWS account id
+        id: account
+        run: |
+          echo "id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.5"
+
+      - name: Terraform init
+        working-directory: infra/terraform
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=nib-demo-prod-tfstate-${{ steps.account.outputs.id }}" \
+            -backend-config="dynamodb_table=nib-demo-prod-terraform-locks" \
+            -backend-config="region=us-east-1"
+
+      - name: Terraform fmt
+        working-directory: infra/terraform
+        run: terraform fmt -check -recursive
+
+      - name: Terraform validate
+        working-directory: infra/terraform
+        run: terraform validate
+
+      - name: Terraform plan
+        working-directory: infra/terraform
+        run: terraform plan -input=false -var-file=production.tfvars -out=tfplan
+
+      - name: Terraform apply
+        working-directory: infra/terraform
+        run: terraform apply -input=false -auto-approve tfplan
+
+      - name: Publish outputs
+        working-directory: infra/terraform
+        run: |
+          {
+            echo "### Terraform outputs"
+            echo
+            echo "| Output | Value |"
+            echo "| --- | --- |"
+            echo "| app_url | $(terraform output -raw app_url) |"
+            echo "| cloudfront_distribution_id | $(terraform output -raw cloudfront_distribution_id) |"
+            echo "| frontend_bucket_name | $(terraform output -raw frontend_bucket_name) |"
+            echo "| ecr_repository_url | $(terraform output -raw ecr_repository_url) |"
+            echo "| ecs_cluster_name | $(terraform output -raw ecs_cluster_name) |"
+            echo "| ecs_service_name | $(terraform output -raw ecs_service_name) |"
+            echo "| ecs_task_definition_family | $(terraform output -raw ecs_task_definition_family) |"
+            echo
+            echo "Next: run **deploy-application** to build and publish the first image."
+            # database_secret_arn is deliberately not among the lines above:
+            # terraform output -raw happily prints a sensitive value if asked,
+            # so the only real control is simply never asking for that one here.
+          } >> "$GITHUB_STEP_SUMMARY"
