@@ -38,7 +38,7 @@ resource "aws_security_group" "rds" {
 
 resource "aws_vpc_security_group_ingress_rule" "alb_from_cloudfront" {
   security_group_id = aws_security_group.alb.id
-  description       = "HTTP from CloudFront's origin-facing addresses only"
+  description       = "HTTP from CloudFront origin-facing addresses only"
   ip_protocol       = "tcp"
   from_port         = 80
   to_port           = 80
