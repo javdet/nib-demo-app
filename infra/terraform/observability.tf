@@ -53,7 +53,7 @@ resource "aws_s3_bucket_acl" "logs" {
     # https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/AccessLogs.html
     grant {
       grantee {
-        id   = "c4c1ede66af53448b93c283ce9448c4ba468c9432aa01d700d3878632f77d2d9"
+        id   = "c4c1ede66af53448b93c283ce9448c4ba468c9432aa01d700d3878632f77d2d0"
         type = "CanonicalUser"
       }
       permission = "FULL_CONTROL"
