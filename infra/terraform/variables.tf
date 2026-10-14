@@ -90,14 +90,17 @@ variable "database_subnet_cidrs" {
 
 # --------------------------------------------------------------- database --
 
+# Major version only by default: RDS retires old minors (16.6 is gone), and
+# with auto_minor_version_upgrade a pinned minor would have Terraform try to
+# downgrade the instance after every AWS upgrade.
 variable "db_engine_version" {
   description = "PostgreSQL engine version for RDS."
   type        = string
-  default     = "16.6"
+  default     = "16"
 
   validation {
-    condition     = can(regex("^16\\.[0-9]+$", var.db_engine_version))
-    error_message = "db_engine_version must be a PostgreSQL 16.x version."
+    condition     = can(regex("^16(\\.[0-9]+)?$", var.db_engine_version))
+    error_message = "db_engine_version must be PostgreSQL 16 (\"16\" or a 16.x minor version)."
   }
 }
 
