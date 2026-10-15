@@ -145,17 +145,12 @@ resource "aws_cloudfront_distribution" "main" {
     origin_request_policy_id = data.aws_cloudfront_origin_request_policy.all_viewer.id
   }
 
-  # Client-side routes have no matching S3 key; CloudFront's own 403/404 for
-  # those keys is rewritten back to the SPA shell instead of reaching the
-  # browser as an error.
+  # Client-side routes have no matching S3 key. The OAC grant has no
+  # s3:ListBucket, so S3 answers a missing key with 403, and only that is
+  # rewritten to the SPA shell. No 404 rule: custom_error_response applies to
+  # every behavior, and one would turn the API's own 404s into a 200 HTML page.
   custom_error_response {
     error_code         = 403
-    response_code      = 200
-    response_page_path = "/index.html"
-  }
-
-  custom_error_response {
-    error_code         = 404
     response_code      = 200
     response_page_path = "/index.html"
   }
