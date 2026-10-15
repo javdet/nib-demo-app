@@ -134,6 +134,13 @@ resource "aws_cloudwatch_log_group" "ecs_exec" {
 # RDS only creates the underlying log stream once it has something to
 # export; the group is created up front so retention is enforced from the
 # first write instead of inheriting CloudWatch's "never expire" default.
+# Adopts the group RDS recreated during the first destroy (before the
+# depends_on in database.tf existed). A no-op once it is in state.
+import {
+  to = aws_cloudwatch_log_group.rds
+  id = "/aws/rds/instance/nib-demo-app-prod-db/postgresql"
+}
+
 resource "aws_cloudwatch_log_group" "rds" {
   name              = local.log_group_names.rds
   retention_in_days = var.log_retention_days
