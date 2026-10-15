@@ -56,6 +56,30 @@ jobs:
       - run: npm run test
       - run: npm run build
 
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+
+      - name: Format
+        run: terraform fmt -check -recursive .
+
+      # No AWS credentials here: this only checks that the configuration is
+      # internally consistent, not that it matches real infrastructure.
+      - name: Init (no backend)
+        run: terraform init -backend=false -input=false
+
+      - name: Validate
+        run: terraform validate
+
   images:
     name: Images
     runs-on: ubuntu-latest
