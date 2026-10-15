@@ -62,6 +62,12 @@ resource "aws_db_instance" "main" {
 
   apply_immediately = false
 
+  # RDS creates its export log group on its own if it is missing. Without this
+  # edge a destroy removes the group while the instance is still shutting down
+  # and writing logs, RDS recreates it outside the state, and the next apply
+  # fails with ResourceAlreadyExistsException.
+  depends_on = [aws_cloudwatch_log_group.rds]
+
   tags = {
     Name = local.names.db_instance
   }
